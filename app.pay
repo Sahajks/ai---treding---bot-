@@ -1,0 +1,347 @@
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+from datetime import datetime, timedelta
+import time
+import requests
+
+from trading_bot import SimpleAITradingBot, DexScreenerAPI
+from config import config
+
+# Page configuration
+st.set_page_config(
+    page_title=config.PAGE_TITLE,
+    page_icon=config.PAGE_ICON,
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# Custom CSS
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 3rem;
+        color: #1f77b4;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    .metric-card {
+        background-color: #f0f2f6;
+        padding: 1rem;
+        border-radius: 10px;
+        margin: 0.5rem;
+    }
+    .buy-signal {
+        background-color: #d4edda;
+        color: #155724;
+        padding: 0.5rem;
+        border-radius: 5px;
+    }
+    .sell-signal {
+        background-color: #f8d7da;
+        color: #721c24;
+        padding: 0.5rem;
+        border-radius: 5px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+class TradingDashboard:
+    def __init__(self):
+        self.bot = SimpleAITradingBot()
+        self.api = DexScreenerAPI()
+        self.initialize_session_state()
+    
+    def initialize_session_state(self):
+        """Initialize session state variables"""
+        if 'bot' not in st.session_state:
+            st.session_state.bot = self.bot
+        if 'last_update' not in st.session_state:
+            st.session_state.last_update = datetime.now()
+        if 'auto_trading' not in st.session_state:
+            st.session_state.auto_trading = False
+    
+    def render_header(self):
+        """Render the dashboard header"""
+        st.markdown('<h1 class="main-header">🤖 AI Memecoin Trading Bot</h1>', unsafe_allow_html=True)
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            portfolio_value = st.session_state.bot.get_portfolio_value()
+            st.metric("Portfolio Value", f"${portfolio_value:,.2f}")
+        
+        with col2:
+            cash = st.session_state.bot.portfolio['cash']
+            st.metric("Available Cash", f"${cash:,.2f}")
+        
+        with col3:
+            positions_count = len(st.session_state.bot.portfolio['positions'])
+            st.metric("Active Positions", positions_count)
+        
+        with col4:
+            total_trades = len(st.session_state.bot.trade_history)
+            st.metric("Total Trades", total_trades)
+    
+    def render_controls(self):
+        """Render trading controls"""
+        st.sidebar.header("🤖 Trading Controls")
+        
+        # Auto-trading toggle
+        auto_trade = st.sidebar.toggle("Auto Trading", value=st.session_state.auto_trading)
+        if auto_trade != st.session_state.auto_trading:
+            st.session_state.auto_trading = auto_trade
+            if auto_trade:
+                st.sidebar.success("Auto trading enabled!")
+            else:
+                st.sidebar.warning("Auto trading disabled!")
+        
+        # Manual trade section
+        st.sidebar.subheader("Manual Trade")
+        
+        symbol = st.sidebar.text_input("Token Symbol", "SOL")
+        price = st.sidebar.number_input("Price", value=100.0, min_value=0.0)
+        amount = st.sidebar.number_input("Amount", value=1.0, min_value=0.0)
+        
+        col1, col2 = st.sidebar.columns(2)
+        
+        with col1:
+            if st.button("Buy", use_container_width=True):
+                result = st.session_state.bot.execute_trade(symbol, 'BUY', price, amount)
+                if 'error' not in result:
+                    st.sidebar.success(f"Bought {amount} {symbol} at ${price}")
+                else:
+                    st.sidebar.error(result['error'])
+        
+        with col2:
+            if st.button("Sell", use_container_width=True):
+                result = st.session_state.bot.execute_trade(symbol, 'SELL', price, amount)
+                if 'error' not in result:
+                    st.sidebar.success(f"Sold {amount} {symbol} at ${price}")
+                else:
+                    st.sidebar.error(result['error'])
+        
+        # Risk management settings
+        st.sidebar.subheader("Risk Management")
+        new_risk = st.sidebar.slider("Risk per Trade (%)", 1, 10, 2) / 100
+        if new_risk != st.session_state.bot.risk_per_trade:
+            st.session_state.bot.risk_per_trade = new_risk
+            st.sidebar.info(f"Risk per trade updated to {new_risk*100}%")
+    
+    def render_market_overview(self):
+        """Render market overview section"""
+        st.header("📈 Market Overview")
+        
+        # Fetch trending pairs
+        with st.spinner("Fetching market data..."):
+            trending_pairs = self.api.get_trending_pairs()
+        
+        if trending_pairs:
+            # Create market data DataFrame
+            market_data = []
+            for pair in trending_pairs[:10]:  # Show top 10
+                base_token = pair.get('baseToken', {})
+                quote_token = pair.get('quoteToken', {})
+                
+                market_data.append({
+                    'Symbol': base_token.get('symbol', 'N/A'),
+                    'Name': base_token.get('name', 'N/A'),
+                    'Price': f"${float(pair.get('priceUsd', 0)):.6f}",
+                    '24h Change': f"{float(pair.get('priceChange', {}).get('h24', 0)):.2f}%",
+                    'Liquidity': f"${float(pair.get('liquidity', {}).get('usd', 0)):,.0f}",
+                    'Volume': f"${float(pair.get('volume', {}).get('h24', 0)):,.0f}",
+                    'DEX': pair.get('dexId', 'N/A')
+                })
+            
+            df = pd.DataFrame(market_data)
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.error("Failed to fetch market data")
+    
+    def render_ai_analysis(self):
+        """Render AI analysis section"""
+        st.header("🔍 AI Analysis - New Memecoins")
+        
+        # Fetch new pairs
+        with st.spinner("Scanning for new memecoins..."):
+            new_pairs = self.api.get_new_pairs(20)
+        
+        if not new_pairs:
+            st.warning("No new pairs found or API error")
+            return
+        
+        # Analyze each pair
+        analysis_results = []
+        for pair in new_pairs:
+            analysis = st.session_state.bot.analyze_memecoin(pair)
+            
+            base_token = pair.get('baseToken', {})
+            analysis_results.append({
+                'Symbol': base_token.get('symbol', 'N/A'),
+                'Name': base_token.get('name', 'N/A'),
+                'AI Score': f"{analysis['score']:.2f}",
+                'Decision': analysis['decision'],
+                'Confidence': f"{analysis['confidence']:.1%}",
+                'Price': f"${float(pair.get('priceUsd', 0)):.8f}",
+                'Liquidity': f"${float(pair.get('liquidity', {}).get('usd', 0)):,.0f}",
+                'Age': self._calculate_age(pair.get('pairCreatedAt')),
+                'Reasons': ' | '.join(analysis['reasons'][:2])  # First 2 reasons
+            })
+        
+        df = pd.DataFrame(analysis_results)
+        
+        # Color code decisions
+        def color_decision(decision):
+            if decision == 'BUY':
+                return 'color: green; font-weight: bold;'
+            elif decision == 'SELL':
+                return 'color: red; font-weight: bold;'
+            else:
+                return 'color: orange;'
+        
+        styled_df = df.style.map(lambda x: color_decision(x) if x in ['BUY', 'SELL', 'HOLD'] else '')
+        st.dataframe(styled_df, use_container_width=True)
+        
+        # Auto-trading logic
+        if st.session_state.auto_trading:
+            st.subheader("🤖 Auto-Trading Actions")
+            for pair in new_pairs:
+                analysis = st.session_state.bot.analyze_memecoin(pair)
+                
+                if analysis['decision'] == 'BUY' and analysis['confidence'] > 0.7:
+                    base_token = pair.get('baseToken', {})
+                    symbol = base_token.get('symbol', 'Unknown')
+                    price = float(pair.get('priceUsd', 0))
+                    
+                    # Calculate position size
+                    stop_loss = price * 0.85  # 15% stop loss
+                    shares = st.session_state.bot.calculate_position_size(symbol, price, stop_loss)
+                    
+                    if shares > 0:
+                        result = st.session_state.bot.execute_trade(symbol, 'BUY', price, shares)
+                        if 'error' not in result:
+                            st.success(f"🤖 AUTO: Bought {shares:.2f} {symbol} at ${price:.6f}")
+    
+    def render_portfolio(self):
+        """Render portfolio section"""
+        st.header("💼 Portfolio Overview")
+        
+        portfolio = st.session_state.bot.portfolio
+        
+        # Current positions
+        if portfolio['positions']:
+            positions_data = []
+            for symbol, position in portfolio['positions'].items():
+                positions_data.append({
+                    'Symbol': symbol,
+                    'Shares': f"{position['shares']:.4f}",
+                    'Avg Cost': f"${position['cost_basis']:.6f}",
+                    'Current Value': f"${position['shares'] * position['cost_basis']:.2f}",
+                    'Entry Time': position['entry_time'].strftime('%Y-%m-%d %H:%M')
+                })
+            
+            df_positions = pd.DataFrame(positions_data)
+            st.dataframe(df_positions, use_container_width=True)
+        else:
+            st.info("No active positions")
+        
+        # Trade history
+        st.subheader("📊 Trade History")
+        if st.session_state.bot.trade_history:
+            history_data = []
+            for trade in st.session_state.bot.trade_history[-10:]:  # Last 10 trades
+                history_data.append({
+                    'Time': trade['timestamp'].strftime('%H:%M:%S'),
+                    'Symbol': trade['symbol'],
+                    'Action': trade['action'],
+                    'Shares': f"{trade['shares']:.4f}",
+                    'Price': f"${trade['price']:.6f}",
+                    'Value': f"${trade['value']:.2f}"
+                })
+            
+            df_history = pd.DataFrame(history_data)
+            st.dataframe(df_history, use_container_width=True)
+        else:
+            st.info("No trade history yet")
+    
+    def render_analytics(self):
+        """Render analytics and charts"""
+        st.header("📊 Analytics & Performance")
+        
+        # Simple performance chart (placeholder)
+        if len(st.session_state.bot.trade_history) > 1:
+            # Create a simple equity curve
+            portfolio_values = [1000]  # Start with initial capital
+            for trade in st.session_state.bot.trade_history:
+                # Simplified - in real implementation, track portfolio value over time
+                pass
+            
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=list(range(len(portfolio_values))),
+                y=portfolio_values,
+                mode='lines',
+                name='Portfolio Value',
+                line=dict(color='green', width=2)
+            ))
+            
+            fig.update_layout(
+                title="Portfolio Performance",
+                xaxis_title="Time",
+                yaxis_title="Portfolio Value ($)",
+                template="plotly_white"
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Not enough data for analytics yet")
+    
+    def _calculate_age(self, created_timestamp):
+        """Calculate token age in human readable format"""
+        if not created_timestamp:
+            return "Unknown"
+        
+        created_time = datetime.fromtimestamp(created_timestamp / 1000)
+        age_delta = datetime.now() - created_time
+        
+        if age_delta.days > 0:
+            return f"{age_delta.days}d ago"
+        elif age_delta.seconds // 3600 > 0:
+            return f"{age_delta.seconds // 3600}h ago"
+        else:
+            return f"{age_delta.seconds // 60}m ago"
+    
+    def run(self):
+        """Run the complete dashboard"""
+        self.render_header()
+        self.render_controls()
+        
+        tab1, tab2, tab3, tab4 = st.tabs([
+            "📈 Market", 
+            "🔍 AI Analysis", 
+            "💼 Portfolio", 
+            "📊 Analytics"
+        ])
+        
+        with tab1:
+            self.render_market_overview()
+        
+        with tab2:
+            self.render_ai_analysis()
+        
+        with tab3:
+            self.render_portfolio()
+        
+        with tab4:
+            self.render_analytics()
+        
+        # Auto-refresh
+        if st.session_state.auto_trading:
+            time.sleep(10)  # Wait 10 seconds
+            st.rerun()
+
+# Main execution
+if __name__ == "__main__":
+    dashboard = TradingDashboard()
+    dashboard.run()
